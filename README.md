@@ -12,13 +12,9 @@
 
 ---
 
-> **示例结果**：下图为 Qwen3-235B-A22B 单机 LoRA（随机初始化）的收敛与吞吐 4 面板总结图（详见「实验线 A5」）。
->
-> ![Qwen3-235B-A22B LoRA 收敛总结](qwen3_235b_lora_convergence_summary.png)
-
----
-
 ## 目录
+
+> 只想立刻跑起来 → **[TL;DR 快速开始（最小命令）](#tldr-快速开始最小命令)**
 
 1. [概述（目标 + 两条线一览 + 结论表）](#1-概述)
 2. [集群与环境](#2-集群与环境)
@@ -38,6 +34,25 @@
 
 ---
 
+## TL;DR 快速开始（最小命令）
+
+> 只想立刻把每条实验跑起来，看这张表即可。每条命令的**预期指标、日志路径、逐步解释**见 [§10 快速开始](#10-快速开始复制即用) 及对应实验章节。
+> 前提：已 clone 仓库（[§3.1](#31-克隆-primus-仓库含子模块)），并在**登录节点** `crs-m2m-cpu-spur-012` 上执行。
+
+| 实验 | 一句话 | 最小命令 |
+|---|---|---|
+| **A1** 单机 235B LoRA | 冒烟基线，20 iter，随机初始化 | `sbatch /shared_nfs/botao/submit_qwen3_235b_lora_1node.sh` |
+| **A5** 单机 235B LoRA 收敛 | 500 iter，存盘彻底禁用 | `sbatch --nodelist=crsuse2-m2m-XXX /shared_nfs/botao/submit_qwen3_235b_lora_1node_converge2.sh` |
+| **A2** 4 节点 235B LoRA（32 GPU） | 先编辑 `mn_config.env` 再提交 | `bash /shared_nfs/botao/mn_submit_driver_pf.sh` |
+| **A3a** 单机全参对照 | 预期 OOM（证明单机放不下全参） | `sbatch /shared_nfs/botao/submit_fullft_1node.sh` |
+| **A3b** 4 节点全参对照 | 先编辑 `mn_config.env` 再提交 | `bash /shared_nfs/botao/mn_submit_driver_pf.sh` |
+| **A4** 真实权重微调 | 下载 → 转换 → 校验 → 训练（4 步） | 见 [A4 四步](#a4-真实权重微调download--convert--validate--train) |
+| **B** 单机 72B @128k 长上下文 LoRA | 131072 token 塞进 8 卡 | `sbatch /shared_nfs/botao/submit_qwen2.5_72B_lora_128k_1node.sh` |
+
+> **注意：** A2 / A3b 提交前需先写好 `/shared_nfs/botao/mn_config.env`（`RUNID` / `NNODES` / `EXP_REL` / `PRIMUS_EXP_NAME` / `MASTER_PORT`），完整示例见 [§10](#10-快速开始复制即用)。
+
+---
+
 ## 1. 概述
 
 ### 1.1 目标
@@ -52,7 +67,7 @@
 
 ### 1.3 最终结论（性能 / 显存 / loss 概览表）
 
-> 数据集统一 `tatsu-lab/alpaca`（alpaca 对话格式）；BF16 混合精度；LoRA `dim=32 alpha=32`。
+> **说明：** 数据集统一 `tatsu-lab/alpaca`（alpaca 对话格式）；BF16 混合精度；LoRA `dim=32 alpha=32`。
 > "单卡显存"给的是**稳态当前占用（rocm mem usage）** 与 **峰值（rocm max mem usage）**。
 > 吞吐单位 **TFLOP/s/GPU**（每卡每秒万亿次浮点运算），均取**稳态**（剔除前 2 步编译预热）。
 
@@ -144,7 +159,7 @@ git clone --recurse-submodules \
 
 ### 3.2 目录布局（`/shared_nfs/botao/`）
 
-```
+```text
 /shared_nfs/botao/
 ├── Primus/                      # 训练框架仓库（分支 feat/megatron/support-sft-native）
 │   ├── examples/
@@ -181,7 +196,7 @@ git clone --recurse-submodules \
 
 整条链路（**记住这张图，后面所有实验都是它的变体**）：
 
-```
+```text
 你在登录节点  ──sbatch──▶  调度器把作业丢到某个计算节点 crsuse2-m2m-XXX
                                     │
                                     ▼
@@ -209,7 +224,7 @@ git clone --recurse-submodules \
 
 一个实验的最终参数 = **三层合并**：
 
-```
+```text
 模型定义 yaml          +   基础训练器 yaml         +   实验 overrides
 qwen3_235B_A22B.yaml       sft_trainer.yaml            <EXP>.yaml 里 overrides: 段
 (层数/隐藏维/专家数..)      (默认迭代/优化器/LoRA默认)    (并行度/LR/存盘策略..)
@@ -257,14 +272,19 @@ num_query_groups: 8       # GQA
 | **DP** | Data Parallel（数据并行） | 剩下的卡各自吃不同的数据批，梯度 all-reduce | 由公式**推导**出来 |
 
 **世界大小（world_size）与 DP 的推导公式**（务必记住）：
-```
+```text
 world_size = 每节点GPU数 × 节点数 = GPUS_PER_NODE × NNODES
 world_size = TP × PP × CP × DP          →   DP = world_size / (TP × PP × CP)
 EP 在 DP 维度内切专家：要求 EP 整除 (world_size / (TP×PP×CP)) = DP
 ```
-- A1 单机：`8 = TP1 × PP1 × CP1 × DP` → **DP=8**；EP=8 把专家摊到这 8 张卡。
-- A2 4 节点：`32 = TP1 × PP4 × CP1 × DP` → **DP=8**；EP=8。
-- B 72B@128k：`8 = TP8 × PP1 × CP1 × DP` → **DP=1**。
+
+各实验按此公式推导出 DP：
+
+| 实验 | 分解（world_size = TP×PP×CP×DP） | 推导出 | 备注 |
+|---|---|---|---|
+| A1 单机 | `8 = TP1 × PP1 × CP1 × DP` | **DP=8** | EP=8 把专家摊到这 8 张卡 |
+| A2 4 节点 | `32 = TP1 × PP4 × CP1 × DP` | **DP=8** | EP=8 |
+| B 72B@128k | `8 = TP8 × PP1 × CP1 × DP` | **DP=1** | — |
 
 ### 4.4 LoRA 块字段解释
 
@@ -302,7 +322,7 @@ LoRA 只训这些低秩适配器（占总参数 **~0.3%**），base 权重冻结
 | 用途 | 验证 **训练动态 + 性能 + 显存 + 技术栈** | **真正微调**模型能力 |
 | 需要下载权重吗 | **不需要**（只用 config+tokenizer） | 需要（先下载 + 转换，见 A4） |
 
-> 原生 SFT 路径**只会从 Megatron `torch_dist` 检查点加载真实 base 权重**。不给 `pretrained_checkpoint`，base 就保持随机 —— 这就是为什么随机跑的 loss 卡在地板上。
+> **注意：** 原生 SFT 路径**只会从 Megatron `torch_dist` 检查点加载真实 base 权重**。不给 `pretrained_checkpoint`，base 就保持随机 —— 这就是为什么随机跑的 loss 卡在地板上。
 
 ---
 
@@ -430,13 +450,13 @@ recompute_num_layers: 1
 sbatch /shared_nfs/botao/submit_fullft_1node.sh
 ```
 **结果**（job 18281）：**OOM**。日志实测：
-```
+```text
 torch.OutOfMemoryError: HIP out of memory. Tried to allocate 24.00 MiB.
 GPU 4 has a total capacity of 287.98 GiB of which 0 bytes is free.
 Of the allocated memory 282.44 GiB is allocated by PyTorch ...
 ```
 即便开了分布式优化器 + 全量重算，单机 8 卡也放不下 235B 的全参训练（每卡 282/288GB 打满）。**这就是全参需要更多卡的证据。**
-> 该脚本用**节点本地缓存**（`HF_HOME=/workspace/hf_local`），不碰 `/shared_nfs/botao/hf_cache`（避免和 A4 的下载互相干扰）。
+> **注意：** 该脚本用**节点本地缓存**（`HF_HOME=/workspace/hf_local`），不碰 `/shared_nfs/botao/hf_cache`（避免和 A4 的下载互相干扰）。
 
 #### A3b 4 节点全参 → **放得下**
 
@@ -511,7 +531,7 @@ sbatch /shared_nfs/botao/run_validate_ckpt.sh    # 容器内跑 validate_fix_ckp
 2. 确保 `common.pt` 里有 `args`（缺了就注入，幂等）。
 
 **预期输出**（job 18152 实测，成功态）：
-```
+```text
 [validate] checkpoint dir: /shared_nfs/botao/megatron_ckpts/qwen3_235B_A22B/release
 [validate] .distcp files: ['__0_0.distcp', '__0_1.distcp']   # 各 235.14 GB
 [validate] .metadata tensors indexed: 24547
@@ -523,7 +543,7 @@ sbatch /shared_nfs/botao/run_validate_ckpt.sh    # 容器内跑 validate_fix_ckp
 ```
 > 曾出现过一次中间态（job 18144）`.metadata` 读到 `Invalid magic number; corrupt file?`（`METADATA_VALID=False`）——那是 `.metadata` 还没最终写完；稍后重跑校验即 `True`。**以 `METADATA_VALID=True` 为准**。
 > 检查点最终布局（实测 `ls`）：
-> ```
+> ```text
 > megatron_ckpts/qwen3_235B_A22B/
 > ├── latest_checkpointed_iteration.txt   # 内容 "release"
 > ├── latest_train_state.pt
@@ -594,6 +614,8 @@ sbatch --nodelist=crsuse2-m2m-XXX \
 - 日志：`/shared_nfs/botao/logs/qwen3_235b_lora_1node_converge2.18718.out`。
 - 收敛 4 面板汇总图：`/shared_nfs/botao/qwen3_235b_lora_convergence_summary.png`（用 `make_convergence_figure.py --figure` 生成）。
 
+![Qwen3-235B-A22B 单机 LoRA 收敛 4 面板汇总图（loss raw+EMA / 稳态放大 / 吞吐 / 单步）](qwen3_235b_lora_convergence_summary.png)
+
 > 历史：原始收敛跑 job **17929** 用了 `save_interval=100`，在 iter 100/200 各写了一个**完整 ~0.5–1.1TB 检查点**，把只剩 ~1.5T 的盘**在 iter ~205 撑爆崩溃**。converge2 就是把存盘彻底禁掉的重跑。
 
 ---
@@ -663,7 +685,7 @@ sbatch /shared_nfs/botao/submit_qwen2.5_72B_lora_128k_1node.sh
 ### 7.1 日志路径规律
 
 **（A）Slurm 作业输出（最常用，先看这个）**：
-```
+```text
 /shared_nfs/botao/logs/<name>.<jobid>.out     # 全部 stdout（含 timing+loss 行）
 /shared_nfs/botao/logs/<name>.<jobid>.err     # stderr
 ```
@@ -685,7 +707,7 @@ sbatch /shared_nfs/botao/submit_qwen2.5_72B_lora_128k_1node.sh
 ### 7.2 iteration 行字段详解
 
 一条真实的 timing 行（已去 ANSI 颜色码）：
-```
+```text
 iteration       11/     500 | consumed samples:           88 | elapsed time per iteration (ms): 189172.8/188861.6 |
 throughput per GPU (TFLOP/s/GPU): 654.2/655.3 | tokens per GPU (tokens/s/GPU): 692.9/694.0 | learning rate: 4.4E-05 |
 global batch size: 8 | lm loss: 1.018988E+01 | loss scale: 1.0 | grad norm: 100.835 |
@@ -770,7 +792,7 @@ squeue -u botahu                    # 看还在跑的作业
   sbatch /shared_nfs/botao/cleanup_ckpts.sh    # 挂载 /shared_nfs，容器内 root 删掉指定的 checkpoints 目录
   ```
   该脚本**只删随机初始化的一次性 checkpoints**（如 `..._converge/checkpoints`、`..._4node/checkpoints`），**保护** `megatron_ckpts/`（A4 真实权重）和真实权重运行产物。job 18374 实测回收了 ~1.65TB。
-  > 改脚本时务必确认删的路径 —— **千万别删 `megatron_ckpts/`**（那是花几小时下载+转换出来的 470GB 真实权重）。
+  > **警告：** 改脚本时务必确认删的路径 —— **千万别删 `megatron_ckpts/`**（那是花几小时下载+转换出来的 470GB 真实权重）。
 
 ### 坑 3：GPU 争用 —— "idle" 节点其实已被占
 - **现象**：调度器显示节点 idle，你的作业一跑就 OOM 或撞别人。
