@@ -26,7 +26,6 @@
 | 项 | 值 / 说明 |
 |---|---|
 | 集群 | AMD MI355X GPU + Slurm 调度 |
-| 登录节点 | **没有 docker**，只用来 `sbatch` 提交作业（不要在上面跑训练） |
 | 计算节点 | **有 docker**，训练在容器里跑；每节点 **8×MI355X（288 GB HBM/卡）** |
 | Slurm 参数 | 账号 `amd-taas-mk1`、分区 `amd-spur`、`--nodes=1` |
 | 训练镜像 | `docker.io/rocm/primus:v26.2`（计算节点首次运行会自动 `docker pull`） |
@@ -191,7 +190,7 @@ modules:
 | `bf16` | `true` | BF16 混合精度 |
 | `sft_dataset_name` | `tatsu-lab/alpaca` | 训练数据集（Alpaca 指令数据） |
 | `seq_length` / `global_batch_size` | `4096` / `128` | 序列长度 / 全局 batch |
-| `train_iters` | `20` | 迭代步数（想看收敛就调大，见附录） |
+| `train_iters` | `20` | 迭代步数 |
 | `lora.enabled` | `true` | 启用 LoRA（dim 32 / alpha 32，只训 ~0.3% 参数） |
 | 无 `pretrained_checkpoint` | — | 基座随机初始化（loss≈12） |
 
@@ -382,7 +381,7 @@ iteration        5/      20 | elapsed time per iteration (ms): 35000.0 | through
 
 ### 7.2 Qwen2.5-72B @128k 长上下文 LoRA
 
-**Qwen2.5-72B（稠密 dense，80 层）在 128k 长上下文下的 LoRA SFT**（BF16、随机初始化、单节点 8×MI355X）。与 7.1 最大的不同是**极长序列**：`seq_length=131072`（128k）、`global_batch_size=8`（每步约 **105 万 token**），靠 **TP=8 + `sequence_parallel`**（不用 CP —— 原生 SFT 前向暂不支持 CP 序列切分）配合**全量激活重算 + flash-attn + 融合 CE**，把每卡显存压到约 **64 GB**。该作业**仍在训练中**，下图与下表均为**截至 iter 144 / 500（训练进行中）** 的实测快照：`lm loss` 从第 1 步的 **12.21** 持续降到当前的 **6.96**（**仍在下降、尚未走平**）；稳态吞吐洁净步约 **655 TFLOP/s/GPU**（中位数 637、均值 605，含周期性掉速），洁净步单步约 **188 s**，每卡 rocm 显存约 **64 GB / 288 GB（~22%）**，全程 **0 NaN**：
+**Qwen2.5-72B（稠密 dense，80 层）在 128k 长上下文下的 LoRA SFT**（BF16、随机初始化、单节点 8×MI355X）。与 7.1 最大的不同是**极长序列**：`seq_length=131072`（128k）、`global_batch_size=8`（每步约 **105 万 token**），靠 **TP=8 + `sequence_parallel`**（不用 CP —— 原生 SFT 前向暂不支持 CP 序列切分）配合**全量激活重算 + flash-attn + 融合 CE**，把每卡显存压到约 **64 GB**。该作业**仍在训练中**，下图与下表均为**截至 iter 150** 的实测快照：`lm loss` 从第 1 步的 **12.21** 持续降到当前的 **6.96**（**仍在下降、尚未走平**）；稳态吞吐洁净步约 **655 TFLOP/s/GPU**（中位数 637、均值 605，含周期性掉速），洁净步单步约 **188 s**，每卡 rocm 显存约 **64 GB / 288 GB（~22%）**，全程 **0 NaN**：
 
 ![Qwen2.5-72B @128k 长上下文 LoRA 收敛与吞吐总结](qwen25_72b_128k_lora_convergence_summary.png)
 
@@ -390,7 +389,7 @@ iteration        5/      20 | elapsed time per iteration (ms): 35000.0 | through
 
 #### 结果指标汇总表
 
-下表为本次 **Qwen2.5-72B @128k 长上下文 LoRA SFT（随机初始化）** 的实测指标，全部取自作业日志 `logs/qwen25_72b_lora128k_1node.18732.out`，为**截至 iter 144（训练进行中）** 的快照（稳态口径 iter ≥ 11）：
+下表为本次 **Qwen2.5-72B @128k 长上下文 LoRA SFT（随机初始化）** 的实测指标，全部取自作业日志 `logs/qwen25_72b_lora128k_1node.18732.out`，为**截至 iter 150** 的快照（稳态口径 iter ≥ 11）：
 
 | 指标 | 数值 |
 |---|---|
@@ -400,13 +399,13 @@ iteration        5/      20 | elapsed time per iteration (ms): 35000.0 | through
 | 上下文长度 | **131072（128k）** |
 | LoRA | dim=32 / alpha=32，4 个 target module（`linear_qkv` / `linear_proj` / `linear_fc1` / `linear_fc2`），约 0.5% 可训练参数 |
 | 数据集 | `tatsu-lab/alpaca`（打包到 128k），global_batch_size=8（每步 ~105 万 token） |
-| 当前步数 | **截至 iter 144 / 500（训练进行中）** |
+| 当前步数 | **截至 iter 150** |
 | 稳态吞吐 | 洁净步 **~655 TFLOP/s/GPU**（中位数 ~637、均值 ~605，含周期性掉速） |
 | 单步耗时 | 洁净步 **~188 s**（中位数 ~194 s、均值 ~212 s） |
 | 每卡显存 | rocm 占用 **~64 GB / 288 GB（~22%）**（峰值 rocm max ~63.9 GB，~22%） |
 | 起始 → 当前 loss | **12.21 → 6.96**（仍在下降，尚未走平） |
 | NaN 迭代数 | **0** |
-| 已训练用时 | **~501 min**（iter 1→144，含周期性慢步） |
+| 已训练用时 | **~501 min** |
 
 ---
 
